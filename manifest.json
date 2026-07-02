@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ページ書き込みツール",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Web ページにマウス/タッチで書き込み。スクロールしても位置がズレず追従し、書き込み込みでページを保存できる。",
   "permissions": ["pageCapture", "downloads", "scripting", "storage", "tabs", "contextMenus"],
   "host_permissions": ["<all_urls>"],

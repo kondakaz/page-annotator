@@ -54,6 +54,7 @@
     // マウスは常に含むため対象外
     cycleStates: { pen: true, highlighter: true, laser: true, eraser: true },
     fadeSec: 3, // レーザーの書き込みが残る秒数（1/3/5/10）
+    saveFormat: "mhtml", // 保存形式: mhtml / png / jpeg / png-full / jpeg-full
     palette: "full", // パレット表示: "full"=詳細 / "simple"=簡単
     // ツールバー位置（ドラッグ移動後）はビューポートに対する割合(0〜1)で保持。
     // こうするとページを拡大縮小してビューポートの論理サイズが変わっても、
@@ -552,10 +553,20 @@
       <span class="pa-label">蛍光</span>
       <span class="pa-swatches" data-group="hl"></span>
     </div>
+    <div class="pa-row pa-saveopt">
+      <span class="pa-label">保存形式</span>
+      <select class="pa-select" id="pa-format" title="保存する形式">
+        <option value="mhtml">MHTML（ページ）</option>
+        <option value="png">PNG（表示範囲）</option>
+        <option value="jpeg">JPEG（表示範囲）</option>
+        <option value="png-full">PNG（ページ全体）</option>
+        <option value="jpeg-full">JPEG（ページ全体）</option>
+      </select>
+    </div>
     <div class="pa-row pa-actions">
       <button class="pa-btn" id="pa-undo" title="元に戻す">↶ 戻す</button>
       <button class="pa-btn" id="pa-clear" title="全消去">🗑 全消去</button>
-      <button class="pa-btn pa-primary" id="pa-save" title="書き込み込みで保存">💾 保存</button>
+      <button class="pa-btn pa-primary" id="pa-save" title="選択した形式で保存">💾 保存</button>
       <button class="pa-btn" id="pa-close" title="閉じる（描画オフ）">✕</button>
     </div>
     <div class="pa-row pa-status"><span id="pa-status"></span></div>
@@ -695,6 +706,8 @@
     bar.querySelectorAll(".pa-fade").forEach((b) => {
       b.classList.toggle("pa-active", Number(b.dataset.fade) === (Number(stored.fadeSec) || 3));
     });
+    const fmtSel = bar.querySelector("#pa-format");
+    if (fmtSel) fmtSel.value = stored.saveFormat || "mhtml";
     bar.querySelectorAll(".pa-tool").forEach((b) => {
       b.classList.toggle("pa-active", b.dataset.tool === state.tool);
     });
@@ -821,6 +834,13 @@
     if (e.target.closest("#pa-save")) return doSave();
   });
 
+  // 保存形式セレクト
+  bar.addEventListener("change", (e) => {
+    const sel = e.target.closest("#pa-format");
+    if (!sel) return;
+    saveState({ saveFormat: sel.value });
+  });
+
   // 巡回対象チェックボックス（状態ごとに巡回へ含める/外す）
   bar.addEventListener("change", (e) => {
     const cb = e.target.closest("[data-cyc]");
@@ -853,18 +873,81 @@
     return title + "_" + ts;
   }
 
+  // 選択中の形式に応じて保存処理を振り分ける
   function doSave() {
-    setStatus("保存中…", false);
-    // 保存物にツールバーが写り込まないよう一時的に隠す（書き込みは残す）
+    const fmt = stored.saveFormat || "mhtml";
+    if (fmt === "png" || fmt === "jpeg") return saveVisibleImage(fmt);
+    if (fmt === "png-full" || fmt === "jpeg-full") return saveFullImage(fmt.replace("-full", ""));
+    return saveMhtml();
+  }
+
+  // ---- 撮影用の一時待機ヘルパ ----
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const nextFrame = () =>
+    new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+  // 撮影前後: ツールバー・カーソルを隠す / stored から表示を復元
+  function beginCapture() {
     bar.style.display = "none";
+    hideCursor();
     svg.style.pointerEvents = "none";
     svg.style.cursor = "";
+  }
+  function endCapture() {
+    render();
+  }
 
+  // background 経由で表示範囲をキャプチャ（レート制限時は少し待って再試行）
+  function captureVisible(format, quality) {
+    return new Promise((resolve, reject) => {
+      let tries = 0;
+      const attempt = () => {
+        tries++;
+        chrome.runtime.sendMessage({ type: "CAPTURE_VISIBLE", format, quality }, (res) => {
+          if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+          if (res && res.ok) return resolve(res.dataUrl);
+          const err = (res && res.error) || "キャプチャに失敗しました";
+          if (tries < 4 && /MAX_CAPTURE|quota|too many/i.test(err)) {
+            setTimeout(attempt, 700);
+          } else {
+            reject(new Error(err));
+          }
+        });
+      };
+      attempt();
+    });
+  }
+
+  // キャプチャ結果を Image 要素として読み込む
+  async function captureVisibleImage(format, quality) {
+    const dataUrl = await captureVisible(format, quality);
+    return await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("画像の読み込みに失敗しました"));
+      img.src = dataUrl;
+    });
+  }
+
+  // background 経由でデータ URL をダウンロード
+  function downloadDataUrl(dataUrl, filename) {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ type: "DOWNLOAD_DATAURL", dataUrl, filename }, (res) => {
+        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+        if (res && res.ok) return resolve();
+        reject(new Error((res && res.error) || "ダウンロードに失敗しました"));
+      });
+    });
+  }
+
+  // ---- MHTML 保存（ページ全体＋書き込みを 1 ファイルに）----
+  function saveMhtml() {
+    setStatus("保存中…", false);
+    beginCapture();
     chrome.runtime.sendMessage(
       { type: "SAVE_MHTML", filename: buildFilename() },
       (res) => {
-        render(); // 表示状態を stored から復元
-
+        endCapture(); // 表示状態を stored から復元
         if (chrome.runtime.lastError) {
           setStatus("保存失敗: " + chrome.runtime.lastError.message, true);
           return;
@@ -877,6 +960,104 @@
         }
       }
     );
+  }
+
+  // ---- 表示範囲の画像保存（PNG / JPEG）----
+  async function saveVisibleImage(fmt) {
+    setStatus("画像を作成中…", false);
+    beginCapture();
+    try {
+      await nextFrame();
+      await sleep(80); // ツールバーが消えた状態を確実に描画してから撮る
+      const quality = fmt === "jpeg" ? 0.92 : undefined;
+      const dataUrl = await captureVisible(fmt, quality);
+      const ext = fmt === "jpeg" ? "jpg" : "png";
+      await downloadDataUrl(dataUrl, buildFilename() + "." + ext);
+      setStatus("保存しました（表示範囲・" + ext.toUpperCase() + "）", false);
+      setTimeout(() => setStatus("", false), 4000);
+    } catch (e) {
+      setStatus("保存失敗: " + (e.message || e), true);
+    } finally {
+      endCapture();
+    }
+  }
+
+  // ---- ページ全体の画像保存（PNG / JPEG）----
+  // 表示範囲を縦にスクロールしながら繰り返しキャプチャし、canvas 上で連結する。
+  // Chrome 拡張には全画面キャプチャ API がないため、この方式で全体を再構成する。
+  async function saveFullImage(fmt) {
+    const startX = window.scrollX;
+    const startY = window.scrollY;
+    beginCapture();
+    try {
+      const vh = window.innerHeight;
+      const docH = Math.max(
+        document.documentElement.scrollHeight,
+        (document.body || document.documentElement).scrollHeight
+      );
+      const total = Math.max(1, Math.ceil(docH / vh));
+
+      // 先頭スライスで実解像度（devicePixelRatio 相当）を確定
+      window.scrollTo(0, 0);
+      await nextFrame();
+      await sleep(300);
+      setStatus("ページ全体を撮影中… (1/" + total + ")", false);
+      const first = await captureVisibleImage("png");
+      const dpr = first.naturalHeight / vh; // 1 CSS px あたりの実ピクセル数
+      const fullW = first.naturalWidth;
+      const fullH = Math.round(docH * dpr);
+
+      // canvas の面積上限を超える場合は縮小して収める
+      const MAX_AREA = 256 * 1024 * 1024;
+      const MAX_SIDE = 32000;
+      let scale = 1;
+      if (fullW * fullH > MAX_AREA) scale = Math.min(scale, Math.sqrt(MAX_AREA / (fullW * fullH)));
+      if (fullH * scale > MAX_SIDE) scale = Math.min(scale, MAX_SIDE / fullH);
+      if (fullW * scale > MAX_SIDE) scale = Math.min(scale, MAX_SIDE / fullW);
+
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.floor(fullW * scale));
+      canvas.height = Math.max(1, Math.floor(fullH * scale));
+      const ctx = canvas.getContext("2d");
+      if (fmt === "jpeg") {
+        ctx.fillStyle = "#ffffff"; // JPEG は透過不可なので背景を白で塗る
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
+
+      const drawSlice = (img, cssY) => {
+        const dy = Math.round(cssY * dpr * scale);
+        ctx.drawImage(img, 0, dy, img.naturalWidth * scale, img.naturalHeight * scale);
+      };
+      drawSlice(first, 0);
+
+      // 2 枚目以降を順に撮って貼り付ける
+      let y = vh;
+      let n = 1;
+      while (y < docH - 0.5) {
+        window.scrollTo(0, y);
+        await nextFrame();
+        await sleep(300); // 描画確定＋キャプチャのレート制限対策
+        n++;
+        setStatus("ページ全体を撮影中… (" + Math.min(n, total) + "/" + total + ")", false);
+        const actualY = window.scrollY; // 末尾はスクロールが頭打ちになる
+        const img = await captureVisibleImage("png");
+        drawSlice(img, actualY);
+        if (actualY + vh >= docH - 0.5) break;
+        y += vh;
+      }
+
+      const mime = fmt === "jpeg" ? "image/jpeg" : "image/png";
+      const dataUrl = canvas.toDataURL(mime, fmt === "jpeg" ? 0.92 : undefined);
+      const ext = fmt === "jpeg" ? "jpg" : "png";
+      await downloadDataUrl(dataUrl, buildFilename() + "_full." + ext);
+      setStatus("保存しました（ページ全体・" + ext.toUpperCase() + "）", false);
+      setTimeout(() => setStatus("", false), 4000);
+    } catch (e) {
+      setStatus("保存失敗: " + (e.message || e), true);
+    } finally {
+      window.scrollTo(startX, startY);
+      endCapture();
+    }
   }
 
   // =========================================================

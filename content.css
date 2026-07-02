@@ -147,6 +147,7 @@
 #pa-toolbar.pa-simple .pa-toggleopt,
 #pa-toolbar.pa-simple .pa-tools,
 #pa-toolbar.pa-simple .pa-fadeopt,
+#pa-toolbar.pa-simple .pa-saveopt,
 #pa-toolbar.pa-simple .pa-actions,
 #pa-toolbar.pa-simple .pa-status {
   display: none !important;
@@ -211,6 +212,21 @@
 #pa-toolbar .pa-fade {
   min-width: 40px !important;
   padding: 3px 6px !important;
+}
+
+#pa-toolbar .pa-select {
+  appearance: auto !important;
+  flex: 1 1 auto !important;
+  min-width: 0 !important;
+  border: 1px solid #bbb !important;
+  background: #fff !important;
+  color: #222 !important;
+  border-radius: 6px !important;
+  padding: 4px 6px !important;
+  font-size: 12px !important;
+  line-height: 1.2 !important;
+  min-height: 28px !important;
+  cursor: pointer !important;
 }
 
 #pa-toolbar .pa-swatches {

@@ -56,6 +56,46 @@ function bufferToBase64(buffer) {
 
 // ---- メッセージ受信 ----
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // 表示範囲のキャプチャ（PNG/JPEG）。content.js が全体撮影のためスライスも要求する
+  if (msg && msg.type === "CAPTURE_VISIBLE") {
+    const windowId = sender.tab && sender.tab.windowId;
+    const opts = { format: msg.format === "jpeg" ? "jpeg" : "png" };
+    if (opts.format === "jpeg") {
+      opts.quality = Math.round((msg.quality || 0.92) * 100);
+    }
+    const cb = (dataUrl) => {
+      if (chrome.runtime.lastError || !dataUrl) {
+        sendResponse({
+          ok: false,
+          error: (chrome.runtime.lastError && chrome.runtime.lastError.message) || "キャプチャに失敗しました",
+        });
+      } else {
+        sendResponse({ ok: true, dataUrl });
+      }
+    };
+    if (windowId == null) chrome.tabs.captureVisibleTab(opts, cb);
+    else chrome.tabs.captureVisibleTab(windowId, opts, cb);
+    return true; // 非同期
+  }
+
+  // データ URL をファイルとしてダウンロード（画像用）
+  if (msg && msg.type === "DOWNLOAD_DATAURL") {
+    chrome.downloads.download(
+      { url: msg.dataUrl, filename: msg.filename || "image.png", saveAs: true },
+      (downloadId) => {
+        if (chrome.runtime.lastError || downloadId == null) {
+          sendResponse({
+            ok: false,
+            error: (chrome.runtime.lastError && chrome.runtime.lastError.message) || "ダウンロードに失敗しました",
+          });
+        } else {
+          sendResponse({ ok: true });
+        }
+      }
+    );
+    return true; // 非同期
+  }
+
   if (msg && msg.type === "SAVE_MHTML") {
     const tabId = sender.tab && sender.tab.id;
     if (tabId == null) {
