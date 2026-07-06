@@ -166,14 +166,6 @@
   margin: 3px 0 !important;
 }
 
-#pa-toolbar.pa-simple .pa-modebar {
-  margin-bottom: 4px !important;
-}
-
-#pa-toolbar.pa-simple .pa-modebtn {
-  padding: 4px 6px !important;
-}
-
 #pa-toolbar.pa-simple .pa-label {
   width: auto !important;
   margin-right: 2px !important;

@@ -46,7 +46,6 @@
     visible: false, // パレット表示中か
     enabled: true, // 描画モードON（false=マウスモード）
     tool: "pen", // pen | highlighter | line | arrow | circle | laser | eraser
-    writeTool: "pen", // 直前に使った「書き込み系」ツール（laser 以外）。Wクリック巡回で復元する
     penColor: PEN_COLORS[0].value,
     hlColor: HL_COLORS[0].value,
     toggleClick: "right", // モード切替の操作: "right"=右ダブルクリック / "left"=左ダブルクリック
@@ -114,8 +113,10 @@
     drawing: false,
     current: null,
     points: [],
+    d: "", // 描画中パスの d 属性文字列（追記のみで更新し、毎回の全再構築を避ける）
     undoStack: [],
   };
+  let capturing = false; // 撮影中（ツールバー・カーソルを隠している間）は true
 
   // =========================================================
   // オーバーレイ SVG
@@ -163,7 +164,7 @@
     } else if (t === "eraser") {
       r = ERASER_RADIUS; fill = "none"; stroke = "#000"; sw = 2; opacity = 0.85;
     } else {
-      hideCursor(); // 直線/矢印/マウスはプレビューなし
+      hideCursor(); // 直線/矢印/円/マウスはプレビューなし
       return;
     }
     cursorDot.setAttribute("cx", pt.x);
@@ -195,8 +196,13 @@
       h: Math.max(d.scrollHeight, b.scrollHeight, d.clientHeight),
     };
   }
+  let lastDocW = -1;
+  let lastDocH = -1;
   function updateOverlaySize() {
     const { w, h } = docSize();
+    if (w === lastDocW && h === lastDocH) return; // 変化なしなら属性書き換えしない
+    lastDocW = w;
+    lastDocH = h;
     svg.setAttribute("width", w);
     svg.setAttribute("height", h);
     svg.style.width = w + "px";
@@ -207,7 +213,7 @@
   window.addEventListener("resize", updateOverlaySize, { passive: true });
   const ro = new ResizeObserver(() => updateOverlaySize());
   if (document.body) ro.observe(document.body);
-  setInterval(updateOverlaySize, 1500);
+  // 取りこぼし対策の定期チェックは、ズーム監視と合わせて 1 本に集約（後方で登録）
 
   // =========================================================
   // 座標変換
@@ -235,15 +241,6 @@
     return p;
   }
 
-  function pointsToD(pts) {
-    if (pts.length === 0) return "";
-    let d = "M " + pts[0].x + " " + pts[0].y;
-    for (let i = 1; i < pts.length; i++) {
-      d += " L " + pts[i].x + " " + pts[i].y;
-    }
-    return d;
-  }
-
   function startDraw(e) {
     const pt = toDocPoint(e);
 
@@ -255,18 +252,19 @@
 
     state.drawing = true;
     state.points = [pt];
+    state.d = "M " + pt.x + " " + pt.y; // 以降は moveDraw が " L x y" を追記する
 
     if (state.tool === "pen") {
       state.current = newPath(state.penColor, PEN_WIDTH, 1, null);
-      state.current.setAttribute("d", pointsToD(state.points));
+      state.current.setAttribute("d", state.d);
     } else if (state.tool === "laser") {
       state.current = newPath(state.penColor, LASER_WIDTH, LASER_OPACITY, null);
       state.current.classList.remove("pa-ink"); // 一時的なので消去/全消去の対象外
       state.current.classList.add("pa-laser");
-      state.current.setAttribute("d", pointsToD(state.points));
+      state.current.setAttribute("d", state.d);
     } else if (state.tool === "highlighter") {
       state.current = newPath(state.hlColor, HL_WIDTH, 0.4, "multiply");
-      state.current.setAttribute("d", pointsToD(state.points));
+      state.current.setAttribute("d", state.d);
     } else if (state.tool === "line" || state.tool === "arrow") {
       const ln = document.createElementNS(SVG_NS, "line");
       ln.setAttribute("x1", pt.x);
@@ -310,7 +308,8 @@
 
     if (state.tool === "pen" || state.tool === "highlighter" || state.tool === "laser") {
       state.points.push(pt);
-      state.current.setAttribute("d", pointsToD(state.points));
+      state.d += " L " + pt.x + " " + pt.y; // 全点から再構築せず末尾に追記のみ
+      state.current.setAttribute("d", state.d);
     } else if (state.tool === "line" || state.tool === "arrow") {
       state.current.setAttribute("x2", pt.x);
       state.current.setAttribute("y2", pt.y);
@@ -626,8 +625,10 @@
   // =========================================================
   // 状態の保存と反映
   // =========================================================
+  let lastWritten = ""; // 自タブが最後に書いた内容。onChanged のエコーによる二重 render 防止用
   function persist() {
     try {
+      lastWritten = JSON.stringify(stored);
       chrome.storage.local.set({ paState: stored });
     } catch (e) {
       /* コンテキスト無効化時など。無視 */
@@ -652,6 +653,10 @@
 
   // stored の内容を画面へ反映（保存はしない）
   function render() {
+    // 撮影中は UI を復元しない。他タブからの storage 同期などで render が走ると
+    // 隠したはずのツールバーが再表示されてスクリーンショットに写り込むため。
+    // 撮影終了時に endCapture() が改めて反映する。
+    if (capturing) return;
     state.tool = stored.tool || "pen";
     state.penColor = stored.penColor || PEN_COLORS[0].value;
     state.hlColor = stored.hlColor || HL_COLORS[0].value;
@@ -763,19 +768,30 @@
     if (key === "mouse") {
       saveState({ enabled: false });
     } else {
-      const patch = { enabled: true, tool: key };
-      if (key !== "laser") patch.writeTool = key; // 書き込み系ツールを記憶
-      saveState(patch);
+      saveState({ enabled: true, tool: key });
     }
-    setStatus((MODE_META[key] || MODE_META.pen).name + "モード", false);
-    setTimeout(() => setStatus("", false), 1500);
+    setStatus((MODE_META[key] || MODE_META.pen).name + "モード", false, 1500);
   }
 
-  function setStatus(text, isError) {
+  // ステータス表示。clearMs を指定すると、その時間後に自動で消す。
+  // タイマーを 1 本に管理し、古いタイマーが新しいメッセージを消す競合を防ぐ。
+  let statusTimer = null;
+  function setStatus(text, isError, clearMs) {
     const s = bar.querySelector("#pa-status");
     if (!s) return;
+    if (statusTimer) {
+      clearTimeout(statusTimer);
+      statusTimer = null;
+    }
     s.textContent = text || "";
     s.classList.toggle("pa-error", !!isError);
+    if (clearMs) {
+      statusTimer = setTimeout(() => {
+        statusTimer = null;
+        s.textContent = "";
+        s.classList.remove("pa-error");
+      }, clearMs);
+    }
   }
 
   // ---- ツールバーのクリック処理 ----
@@ -797,32 +813,33 @@
     const tgBtn = e.target.closest(".pa-tg");
     if (tgBtn) {
       saveState({ toggleClick: tgBtn.dataset.tg });
-      setStatus(tgBtn.dataset.tg === "left" ? "左ダブルクリックで切替" : "右ダブルクリックで切替", false);
-      setTimeout(() => setStatus("", false), 1500);
+      setStatus(tgBtn.dataset.tg === "left" ? "左ダブルクリックで切替" : "右ダブルクリックで切替", false, 1500);
       return;
     }
     const fadeBtn = e.target.closest(".pa-fade");
     if (fadeBtn) {
       saveState({ fadeSec: Number(fadeBtn.dataset.fade) });
-      setStatus("レーザー残存 " + fadeBtn.dataset.fade + " 秒", false);
-      setTimeout(() => setStatus("", false), 1500);
+      setStatus("レーザー残存 " + fadeBtn.dataset.fade + " 秒", false, 1500);
       return;
     }
     const toolBtn = e.target.closest(".pa-tool");
     if (toolBtn) {
-      const t = toolBtn.dataset.tool;
-      const patch = { tool: t, enabled: true };
-      if (t !== "laser") patch.writeTool = t; // 書き込み系ツールを記憶
-      saveState(patch);
+      saveState({ tool: toolBtn.dataset.tool, enabled: true });
       return;
     }
     const sw = e.target.closest(".pa-swatch");
     if (sw) {
       if (sw.dataset.group === "pen") {
-        // ペン/図形/レーザーはペン色を共有。レーザー中は色だけ変える
-        const nextTool =
-          state.tool === "highlighter" || state.tool === "eraser" ? "pen" : state.tool;
-        saveState({ penColor: sw.dataset.color, tool: nextTool, enabled: true });
+        // ペン色スウォッチ: ペン系ツール（ペン/直線/矢印/円）の間は色だけ変え、
+        // それ以外（蛍光/消し/レーザー/マウス）からは常にペンモードへ切り替える。
+        // かつてはレーザー中「色だけ変更」だったが、レーザー後にペンへ戻れなく
+        // 見える混乱を招いたため廃止（レーザー色は切替後も penColor を共有）。
+        const keep =
+          state.tool === "pen" ||
+          state.tool === "line" ||
+          state.tool === "arrow" ||
+          state.tool === "circle";
+        saveState({ penColor: sw.dataset.color, tool: keep ? state.tool : "pen", enabled: true });
       } else {
         saveState({ hlColor: sw.dataset.color, tool: "highlighter", enabled: true });
       }
@@ -834,25 +851,19 @@
     if (e.target.closest("#pa-save")) return doSave();
   });
 
-  // 保存形式セレクト
+  // 変更系コントロール（保存形式セレクト / 巡回対象チェックボックス）
   bar.addEventListener("change", (e) => {
     const sel = e.target.closest("#pa-format");
-    if (!sel) return;
-    saveState({ saveFormat: sel.value });
-  });
-
-  // 巡回対象チェックボックス（状態ごとに巡回へ含める/外す）
-  bar.addEventListener("change", (e) => {
+    if (sel) {
+      saveState({ saveFormat: sel.value });
+      return;
+    }
     const cb = e.target.closest("[data-cyc]");
     if (!cb) return;
     const key = cb.dataset.cyc;
     const next = Object.assign({}, stored.cycleStates, { [key]: cb.checked });
     saveState({ cycleStates: next });
-    setStatus(
-      MODE_META[key].name + (cb.checked ? "を巡回に追加" : "を巡回から除外"),
-      false
-    );
-    setTimeout(() => setStatus("", false), 1500);
+    setStatus(MODE_META[key].name + (cb.checked ? "を巡回に追加" : "を巡回から除外"), false, 1500);
   });
 
   // =========================================================
@@ -888,12 +899,14 @@
 
   // 撮影前後: ツールバー・カーソルを隠す / stored から表示を復元
   function beginCapture() {
+    capturing = true; // 撮影中は render() を抑止（写り込み防止）
     bar.style.display = "none";
     hideCursor();
     svg.style.pointerEvents = "none";
     svg.style.cursor = "";
   }
   function endCapture() {
+    capturing = false;
     render();
   }
 
@@ -953,8 +966,7 @@
           return;
         }
         if (res && res.ok) {
-          setStatus("保存しました（.mhtml）", false);
-          setTimeout(() => setStatus("", false), 4000);
+          setStatus("保存しました（.mhtml）", false, 4000);
         } else {
           setStatus("保存失敗: " + ((res && res.error) || "不明なエラー"), true);
         }
@@ -973,8 +985,7 @@
       const dataUrl = await captureVisible(fmt, quality);
       const ext = fmt === "jpeg" ? "jpg" : "png";
       await downloadDataUrl(dataUrl, buildFilename() + "." + ext);
-      setStatus("保存しました（表示範囲・" + ext.toUpperCase() + "）", false);
-      setTimeout(() => setStatus("", false), 4000);
+      setStatus("保存しました（表示範囲・" + ext.toUpperCase() + "）", false, 4000);
     } catch (e) {
       setStatus("保存失敗: " + (e.message || e), true);
     } finally {
@@ -998,7 +1009,10 @@
       const total = Math.max(1, Math.ceil(docH / vh));
 
       // 先頭スライスで実解像度（devicePixelRatio 相当）を確定
-      window.scrollTo(0, 0);
+      // scrollTo は behavior:"instant" 固定にする。ページ CSS の
+      // scroll-behavior:smooth があるとアニメーション途中で撮影して
+      // スライス位置がズレるため。
+      window.scrollTo({ left: 0, top: 0, behavior: "instant" });
       await nextFrame();
       await sleep(300);
       setStatus("ページ全体を撮影中… (1/" + total + ")", false);
@@ -1034,7 +1048,7 @@
       let y = vh;
       let n = 1;
       while (y < docH - 0.5) {
-        window.scrollTo(0, y);
+        window.scrollTo({ left: 0, top: y, behavior: "instant" });
         await nextFrame();
         await sleep(300); // 描画確定＋キャプチャのレート制限対策
         n++;
@@ -1050,12 +1064,11 @@
       const dataUrl = canvas.toDataURL(mime, fmt === "jpeg" ? 0.92 : undefined);
       const ext = fmt === "jpeg" ? "jpg" : "png";
       await downloadDataUrl(dataUrl, buildFilename() + "_full." + ext);
-      setStatus("保存しました（ページ全体・" + ext.toUpperCase() + "）", false);
-      setTimeout(() => setStatus("", false), 4000);
+      setStatus("保存しました（ページ全体・" + ext.toUpperCase() + "）", false, 4000);
     } catch (e) {
       setStatus("保存失敗: " + (e.message || e), true);
     } finally {
-      window.scrollTo(startX, startY);
+      window.scrollTo({ left: startX, top: startY, behavior: "instant" });
       endCapture();
     }
   }
@@ -1168,12 +1181,24 @@
   // ズーム倍率の補正と、パレットを画面内へ収めるクランプの両方を行う。
   // ズームは resize を伴って devicePixelRatio を変える。取りこぼし対策に
   // 定期チェックも併用する。
+  let lastVpW = -1;
+  let lastVpH = -1;
   function onViewportChange() {
-    applyZoomCompensation();
+    applyZoomCompensation(); // ズーム変化時は内部で再配置まで行う
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    if (vw === lastVpW && vh === lastVpH) return; // 変化なしなら再配置不要
+    lastVpW = vw;
+    lastVpH = vh;
     repositionInBounds();
   }
   window.addEventListener("resize", onViewportChange, { passive: true });
-  setInterval(onViewportChange, 1000);
+  // 定期チェックは 1 本に集約（オーバーレイサイズ・ズーム・位置クランプ）。
+  // いずれも変化がなければ即 return する軽量処理。
+  setInterval(() => {
+    updateOverlaySize();
+    onViewportChange();
+  }, 1000);
   applyZoomCompensation();
   repositionInBounds();
 
@@ -1193,8 +1218,12 @@
   try {
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== "local" || !changes.paState) return;
-      stored = Object.assign({}, DEFAULTS, changes.paState.newValue || {});
-      render();
+      const nv = changes.paState.newValue || {};
+      // 自タブの saveState 由来のエコーは反映済みなので render を省く
+      // （saveState → persist → onChanged で毎操作 2 回描画されるのを防ぐ）
+      const isEcho = JSON.stringify(nv) === lastWritten;
+      stored = Object.assign({}, DEFAULTS, nv);
+      if (!isEcho) render();
     });
   } catch (e) {
     /* 無視 */
